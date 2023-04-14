@@ -1,3 +1,3 @@
 # STSNet_SW
 
-Codes and models for manuscript submitted to ACII 2023.
+Codes and models for the manuscript submitted to ACII 2023.
