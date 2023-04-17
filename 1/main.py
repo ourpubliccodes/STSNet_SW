@@ -1,179 +1,513 @@
-from __future__ import print_function
-from __future__ import division
-
-# 可直接调用此函数
-def set_seed(seed=1):
-    print('seed = {}'.format(seed))
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    # 使用lstm需要添加下述环境变量为:16:8，如果cuda版本为10.2，去百度一下应该将环境变量设为多少。
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
-    # torch.backends.cudnn.benchmark = True
-    # use_deterministic_algorithms用于自查自己的代码是否包含不确定的算法，报错说明有，根据报错位置查询并替代该处的算法。1.8之前的版本好像没有此方法。
-    # torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.enabled = False
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
-# 这部分不要动，官方给的。。。
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2 ** 32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
-import os
-import numpy as np
+__author__ = 'Jiri Fajtl'
+__email__ = 'ok1zjf@gmail.com'
+__version__= '3.6'
+__status__ = "Research"
+__date__ = "1/12/2018"
+__license__= "MIT License"
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-from torch.autograd import Variable
-import torchvision
-import torchvision.models as models
-
-###Data require
+from torchvision import transforms
+import numpy as np
+import time
+import glob
+import random
 import argparse
-from datasets.dataset import VolumeDataset
-from datasets.dataset import VolumeDatasetTest
-from datasets.transforms import *
-from torch.utils.data import DataLoader
+import h5py
+import json
+import torch.nn.init as init
 
-# ###Model require
-from models import resnet
-from util import tr_epoch, ts_epoch
-
-
-set_seed()
-
-parser = argparse.ArgumentParser('Resnets')
-parser.add_argument('--seed', type=int, default=1)
-
-# ========================= Data Configs ==========================
-parser.add_argument('--data_root_train', type=str, default='')
-parser.add_argument('--list_file_train', type=str, default='./micro/train21.txt')
-parser.add_argument('--data_root_test', type=str, default='')
-parser.add_argument('--list_file_test', type=str, default='./micro/test21.txt')
-parser.add_argument('--modality', type=str, default='Gray', help='RGB | Gray')
-parser.add_argument('--batch_size', type=int, default=1)
-parser.add_argument('--num_workers', type=int, default=16)
-
-# ========================= Model Configs ==========================
-parser.add_argument('--premodel', default='', type=str, help='Pretrained model (.pth)')
-#parser.add_argument('--premodel', default='XXX/epoch100.pt', type=str, help='Pretrained model (.pth)')
-parser.add_argument('--num_classes', default=2, type=int, help='Number of classes')
-parser.add_argument('--no_cuda', action='store_true', help='If true, cuda is not used.')
-parser.set_defaults(no_cuda=False)
-
-parser.add_argument('--lr', type=float, default=1e-3)
-parser.add_argument('--PenaltyBw', type=float, default=1)
-parser.add_argument('--PenaltyB', type=float, default=0.1)
-parser.add_argument('--momentum', type=float, default=0.9)
-parser.add_argument('--weight_decay', type=float, default=0.0005)
-parser.add_argument('--epoch', type=int, default=30)
-parser.add_argument('--device_ids',  type=int, default=0)
-
-# ========================= Model Save ==========================
-parser.add_argument('--save_path', type=str, default='./pt')
-parser.add_argument('--checkpoint_path', type=str, default='')
-
-args = parser.parse_args()
+from config import  *
+from sys_utils import *
+from vsum_tools import  *
+from vasnet_model import  *
 
 
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname == 'Linear':
+        init.xavier_uniform_(m.weight, gain=np.sqrt(2.0))
+        if m.bias is not None:
+            init.constant_(m.bias, 0.1)
 
-###Data read
+def parse_splits_filename(splits_filename):
+    # Parse split file and count number of k_folds
+    spath, sfname = os.path.split(splits_filename)
+    sfname, _ = os.path.splitext(sfname)
+    dataset_name = sfname.split('_')[0]  # Get dataset name e.g. tvsum
+    dataset_type = sfname.split('_')[1]  # augmentation type e.g. aug
 
-test_dataset = VolumeDatasetTest(data_root=args.data_root_test, list_file_root=args.list_file_test, modality=args.modality,
-                            transform=torchvision.transforms.Compose([
-                                GroupScale((128,128)),
-                                ToTorchFormatTensor(div=True),
-                            ]),
-)
-test_loader = DataLoader(test_dataset,batch_size=1,shuffle=False,num_workers=args.num_workers,drop_last=False)
+    # The keyword 'splits' is used as the filename fields terminator from historical reasons.
+    if dataset_type == 'splits':
+        # Split type is not present
+        dataset_type = ''
+
+    # Get number of discrete splits within each split json file
+    with open(splits_filename, 'r') as sf:
+        splits = json.load(sf)
+
+    return dataset_name, dataset_type, splits
+
+def lookup_weights_splits_file(path, dataset_name, dataset_type, split_id):
+    dataset_type_str = '' if dataset_type == '' else dataset_type + '_'
+    weights_filename = path + '/models/{}_{}splits_{}_*.tar.pth'.format(dataset_name, dataset_type_str, split_id)
+    weights_filename = glob.glob(weights_filename)
+    if len(weights_filename) == 0:
+        print("Couldn't find model weights: ", weights_filename)
+        return ''
+
+    # Get the first weights file in the dir
+    weights_filename = weights_filename[0]
+    splits_file = path + '/splits/{}_{}splits.json'.format(dataset_name, dataset_type_str)
+
+    return weights_filename, splits_file
 
 
-# # ###Model
-model = resnet.resnet18(pretrained=False, num_classes=args.num_classes)
-if args.premodel:
-    pretrained_dict = torch.load(args.premodel)
-    model_dict = model.state_dict()
-    pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict.keys() and v.size() == model_dict[k].size()}
-    missed_params = [k for k, v in model_dict.items() if not k in pretrained_dict.keys()]
-    print('loaded params/tot params:{}/{}'.format(len(pretrained_dict),len(model_dict)))
-    print('miss matched params:',missed_params)
-    model_dict.update(pretrained_dict)
-    model.load_state_dict(model_dict)
-if not args.no_cuda:
-    model = model.cuda(args.device_ids)
-#print(model)
+class AONet:
+
+    def __init__(self, hps: HParameters):
+        self.hps = hps
+        self.model = None
+        self.log_file = None
+        self.verbose = hps.verbose
 
 
-# ###Hyperparam
-criterion1 = nn.CrossEntropyLoss()
-if not args.no_cuda:
-    criterion1 = criterion1.cuda(args.device_ids)
-optimizer = optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epoch/5, eta_min=1e-8, last_epoch=-1)
+    def fix_keys(self, keys, dataset_name = None):
+        """
+        :param keys:
+        :return:
+        """
+        # dataset_name = None
+        if len(self.datasets) == 1:
+            dataset_name = next(iter(self.datasets))
 
-class BwLoss(nn.Module):
-    def __init__(self):
-        super(BwLoss, self).__init__()
-    def forward(self, Bw):
-        loss_Bw = 0.0
-        for i in range(Bw.shape[0]):
-            temp = Bw[i,:]
-            loss_Bw += 2.0-(torch.mean(temp[temp>torch.mean(temp)])-torch.mean(temp[temp<torch.mean(temp)]))
-        return  args.PenaltyBw*loss_Bw/Bw.shape[0]
-criterionBw = BwLoss()
-if not args.no_cuda:
-    criterionBw = criterionBw.cuda(args.device_ids)
+        keys_out = []
+        for key in keys:
+            t = key.split('/')
+            if len(t) != 2:
+                assert dataset_name is not None, "ERROR dataset name in some keys is missing but there are multiple dataset {} to choose from".format(len(self.datasets))
 
-class BLoss(nn.Module):
-    def __init__(self):
-        super(BLoss, self).__init__()
-    def forward(self, B):
-        loss_B = 0.0
-        for i in range(B.shape[0]):
-            loss_B += torch.max(torch.Tensor([0.0]).cuda(args.device_ids), torch.sum(B[i,:]) - torch.Tensor([1.0]).cuda(args.device_ids))
-        return  args.PenaltyB*loss_B/B.shape[0]
-criterionB = BLoss()
-if not args.no_cuda:
-    criterionB = criterionB.cuda(args.device_ids)
+                key_name = dataset_name+'/'+key
+                keys_out.append(key_name)
+            else:
+                keys_out.append(key)
+        #keys_out 是训练和测试的视频
+        return keys_out
 
-Acc_best = 0.0
-for epoch in range(1,args.epoch+1):
-    train_dataset = VolumeDataset(data_root=args.data_root_train, list_file_root=args.list_file_train,
-                                  modality=args.modality,
-                                  transform=torchvision.transforms.Compose([
-                                      GroupScaleRandomCrop((144, 144), (128, 128)),
-                                      ToTorchFormatTensor(div=True),
-                                  ]),
-                                  )
-    # train_loader = DataLoader(train_dataset,batch_size=args.batch_size,shuffle=True,num_workers=args.num_workers,drop_last=False)
-    train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
-                                               pin_memory=True,
-                                               batch_size=args.batch_size,
-                                               shuffle=True,
-                                               num_workers=args.num_workers,
-                                               drop_last=True,
-                                               worker_init_fn=seed_worker)
-    print('train_dataset ', len(train_dataset))
-    print('epoch {}:'.format(epoch), 'lr is {}'.format(optimizer.param_groups[0]['lr']))
-    ###train and test
-    print("Training-------------------")
-    tr_epoch(model=model, data_loader=train_loader, criterion1=criterion1, criterionB=criterionB, criterionBw=criterionBw, optimizer=optimizer, args=args)
-    print("Testing====================")
-    Acc = ts_epoch(model=model, data_loader=test_loader, criterion1=criterion1, criterionB=criterionB, criterionBw=criterionBw, args=args)
-    scheduler.step(epoch)
-    #save model
-    if epoch>=10:
-        if Acc>=Acc_best:
-            Acc_best = Acc
-            torch.save(model.state_dict(), args.save_path + '/' + 'epoch' + str(epoch) + '.pt')
+
+    def load_datasets(self, datasets = None):
+        """
+        Loads all h5 datasets from the datasets list into a dictionary self.dataset
+        referenced by their base filename
+        :param datasets:  List of dataset filenames
+        :return:
+        """
+        if datasets is None:
+            datasets = self.hps.datasets
+
+        datasets_dict = {}
+        for dataset in datasets:
+            _, base_filename = os.path.split(dataset)
+            base_filename, _ = os.path.splitext(base_filename)
+            print("Loading:", dataset)
+            # dataset_name = base_filename.split('_')[2]
+            # print("\tDataset name:", dataset_name)
+            datasets_dict[base_filename] = h5py.File(dataset, 'r')
+
+        self.datasets = datasets_dict
+        return datasets_dict
+
+
+    def load_split_file(self, splits_file):
+
+        self.dataset_name, self.dataset_type, self.splits = parse_splits_filename(splits_file)
+        n_folds = len(self.splits)
+        self.split_file = splits_file
+        with open('result.txt', 'a') as f:
+            f.write('Loading splits from: '+str(splits_file) + '\n')
+        print("Loading splits from: ",splits_file)
+
+        return n_folds
+
+
+    def select_split(self, split_id):
+        with open('result.txt', 'a') as f:
+            f.write('Selecting split: '+ str(split_id) + '\n')
+        print("Selecting split: ",split_id)
+
+        self.split_id = split_id
+        n_folds = len(self.splits)
+        assert self.split_id < n_folds, "split_id (got {}) exceeds {}".format(self.split_id, n_folds)
+
+        split = self.splits[self.split_id]
+        self.train_keys = split['train_keys']
+        self.test_keys = split['test_keys']
+
+        dataset_filename = self.hps.get_dataset_by_name(self.dataset_name)[0]
+        _,dataset_filename = os.path.split(dataset_filename)
+        dataset_filename,_ = os.path.splitext(dataset_filename)
+        self.train_keys = self.fix_keys(self.train_keys, dataset_filename)
+        self.test_keys = self.fix_keys(self.test_keys, dataset_filename)
+        return
+
+
+
+    def load_model(self, model_filename):
+        self.model.load_state_dict(torch.load(model_filename, map_location=lambda storage, loc: storage))
+        return
+
+
+    def initialize(self, cuda_device=None):
+        rnd_seed = 12345
+        random.seed(rnd_seed)
+        np.random.seed(rnd_seed)
+        torch.manual_seed(rnd_seed)
+
+        self.model = VASNet()
+        self.model.eval()
+        self.model.apply(weights_init)
+        #print(self.model)
+
+        cuda_device = cuda_device or self.hps.cuda_device 
+
+        if self.hps.use_cuda:
+            print("Setting CUDA device: ",cuda_device)
+            torch.cuda.set_device(cuda_device)
+            torch.cuda.manual_seed(rnd_seed)
+
+        if self.hps.use_cuda:
+            self.model.cuda()
+
+        return
+
+
+    def get_data(self, key):
+        key_parts = key.split('/')
+        assert len(key_parts) == 2, "ERROR. Wrong key name: "+key
+        dataset, key = key_parts
+        return self.datasets[dataset][key]
+
+    def lookup_weights_file(self, data_path):
+        dataset_type_str = '' if self.dataset_type == '' else self.dataset_type + '_'
+        print('data_path')
+        print(data_path)
+        weights_filename = data_path + '/models/{}_{}aug_splits_{}_*.tar.pth'.format(self.dataset_name, dataset_type_str, self.split_id)
+        print('weights_filename')
+        print(weights_filename)
+        weights_filename = glob.glob(weights_filename)
+        if len(weights_filename) == 0:
+            print("Couldn't find model weights: ", weights_filename)
+            return ''
+
+        # Get the first weights filename in the dir
+        weights_filename = weights_filename[0]
+        splits_file = data_path + '/splits/{}_{}splits.json'.format(self.dataset_name, dataset_type_str)
+
+        return weights_filename, splits_file
+
+
+    def train(self, output_dir='EX-0'):
+
+        print("Initializing VASNet model and optimizer...")
+        self.model.train()
+
+        criterion = nn.MSELoss()
+
+        if self.hps.use_cuda:
+            criterion = criterion.cuda()
+
+        parameters = filter(lambda p: p.requires_grad, self.model.parameters())
+        self.optimizer = torch.optim.Adam(parameters, lr=self.hps.lr[0], weight_decay=self.hps.l2_req)
+
+        print("Starting training...")
+
+        max_val_fscore = 0
+        max_val_fscore_epoch = 0
+        train_keys = self.train_keys[:]
+
+        lr = self.hps.lr[0]
+        for epoch in range(self.hps.epochs_max):
+
+            print("Epoch: {0:6}".format(str(epoch)+"/"+str(self.hps.epochs_max)), end='')
+            with open('result.txt', 'a') as f:
+                f.write(str("Epoch: {0:6}".format(str(epoch)+"/"+str(self.hps.epochs_max))) + '\n')
+            self.model.train()
+            avg_loss = []
+
+            random.shuffle(train_keys)
+
+            for i, key in enumerate(train_keys):
+                dataset = self.get_data(key)
+                seq = dataset['features'][...]
+                seq = torch.from_numpy(seq).unsqueeze(0)
+                target = dataset['gtscore'][...]
+                target = torch.from_numpy(target).unsqueeze(0)
+
+                # Normalize frame scores
+                target -= target.min()
+                target /= target.max()
+
+                if self.hps.use_cuda:
+                    seq, target = seq.float().cuda(), target.float().cuda()
+
+                seq_len = seq.shape[1]
+                y, _ = self.model(seq,seq_len)
+                loss_att = 0
+
+                loss = criterion(y, target)
+                # loss2 = y.sum()/seq_len
+                loss = loss + loss_att
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                avg_loss.append([float(loss), float(loss_att)])
+
+            # Evaluate test dataset
+            val_fscore, video_scores = self.eval(self.test_keys)
+            if max_val_fscore < val_fscore:
+                max_val_fscore = val_fscore
+                max_val_fscore_epoch = epoch
+            print('val_fscore')
+            print(val_fscore)
+            print('max_val_fscore')
+            print(max_val_fscore)
+            avg_loss = np.array(avg_loss)
+            print("   Train loss: {0:.05f}".format(np.mean(avg_loss[:, 0])), end='')
+            print('   Test F-score avg/max: {0:0.5}/{1:0.5}'.format(val_fscore, max_val_fscore))
+
+            if self.verbose:
+                video_scores = [["No", "Video", "F-score"]] + video_scores
+                print_table(video_scores, cell_width=[3,40,8])
+
+            # Save model weights
+            path, filename = os.path.split(self.split_file)
+            base_filename, _ = os.path.splitext(filename)
+            path = os.path.join(output_dir, 'models_temp', base_filename+'_'+str(self.split_id))
+            os.makedirs(path, exist_ok=True)
+            filename = str(epoch)+'_'+str(round(val_fscore*100,3))+'.pth.tar'
+            torch.save(self.model.state_dict(), os.path.join(path, filename))
+
+        return max_val_fscore, max_val_fscore_epoch
+
+
+    def eval(self, keys, results_filename=None):
+
+        self.model.eval()
+        summary = {}
+        att_vecs = {}
+        with torch.no_grad():
+            for i, key in enumerate(keys):
+                #改动
+                data = self.get_data(key)
+                #seq = self.dataset[key]['features'][...]
+                seq = data['features'][...]
+                seq = torch.from_numpy(seq).unsqueeze(0)
+
+                if self.hps.use_cuda:
+                    seq = seq.float().cuda()
+
+                y, att_vec = self.model(seq, seq.shape[1])
+                summary[key] = y[0].detach().cpu().numpy()
+                att_vecs[key] = att_vec.detach().cpu().numpy()
+
+        f_score, video_scores = self.eval_summary(summary, keys, metric=self.dataset_name,
+                    results_filename=results_filename, att_vecs=att_vecs)
+
+        return f_score, video_scores
+
+
+    def eval_summary(self, machine_summary_activations, test_keys, results_filename=None, metric='tvsum', att_vecs=None):
+
+        eval_metric = 'avg' if metric == 'tvsum' else 'max'
+
+        if results_filename is not None:
+            h5_res = h5py.File(results_filename, 'w')
+
+        fms = []
+        video_scores = []
+        for key_idx, key in enumerate(test_keys):
+            d = self.get_data(key)
+            print('key')
+            print(key)
+            with open('result.txt', 'a') as f:
+                f.write(str(key)+'\n')
+            probs = machine_summary_activations[key]
+
+            if 'change_points' not in d:
+                print("ERROR: No change points in dataset/video ",key)
+
+            cps = d['change_points'][...]
+            num_frames = d['n_frames'][()]
+            nfps = d['n_frame_per_seg'][...].tolist()
+            positions = d['picks'][...]
+            user_summary = d['user_summary'][...]
+
+            machine_summary = generate_summary(probs, cps, num_frames, nfps, positions)
+            with open('result.txt', 'a') as f:
+                f.write(str(machine_summary) + '\n')
+            print('machine_summary')
+            print(machine_summary)
+            print('user_summary')
+            print(user_summary)
+
+
+            fm, _, _ = evaluate_summary(machine_summary, user_summary, eval_metric)
+            fms.append(fm)
+            # Reporting & logging
+            video_scores.append([key_idx + 1, key, "{:.1%}".format(fm)])
+
+            if results_filename:
+                gt = d['gtscore'][...]
+                h5_res.create_dataset(key + '/score', data=probs)
+                h5_res.create_dataset(key + '/machine_summary', data=machine_summary)
+                h5_res.create_dataset(key + '/gtscore', data=gt)
+                h5_res.create_dataset(key + '/fm', data=fm)
+                h5_res.create_dataset(key + '/picks', data=positions)
+
+                video_name = key.split('/')[1]
+                if 'video_name' in d:
+                    video_name = d['video_name'][...]
+                h5_res.create_dataset(key + '/video_name', data=video_name)
+
+                if att_vecs is not None:
+                    h5_res.create_dataset(key + '/att', data=att_vecs[key])
+
+        mean_fm = np.mean(fms)
+
+        # Reporting & logging
+        if results_filename is not None:
+            h5_res.close()
+
+        return mean_fm, video_scores
+
+
+#==============================================================================================
+
+
+
+def eval_split(hps, splits_filename, data_dir='test'):
+
+    print("\n")
+    ao = AONet(hps)
+    ao.initialize()
+    ao.load_datasets()
+    ao.load_split_file(splits_filename)
+
+    val_fscores = []
+    for split_id in range(len(ao.splits)):
+        ao.select_split(split_id)
+        weights_filename, _ = ao.lookup_weights_file(data_dir)
+        print('weights_filename')
+        print(weights_filename)
+        print("Loading model:", weights_filename)
+        ao.load_model(weights_filename)
+        val_fscore, video_scores = ao.eval(ao.test_keys)
+        val_fscores.append(val_fscore)
+
+        val_fscore_avg = np.mean(val_fscores)
+
+        if hps.verbose:
+            video_scores = [["No.", "Video", "F-score"]] + video_scores
+            print_table(video_scores, cell_width=[4,45,5])
+
+        print("Avg F-score: ", val_fscore)
+        print("")
+
+    print("Total AVG F-score: ", val_fscore_avg)
+    return val_fscore_avg
+
+
+def train(hps):
+    os.makedirs(hps.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(hps.output_dir, 'splits'), exist_ok=True)
+    os.makedirs(os.path.join(hps.output_dir, 'code'), exist_ok=True)
+    os.makedirs(os.path.join(hps.output_dir, 'models'), exist_ok=True)
+    os.system('cp -f splits/*.json  ' + hps.output_dir + '/splits/')
+    os.system('cp *.py ' + hps.output_dir + '/code/')
+
+    # Create a file to collect results from all splits
+    f = open(hps.output_dir + '/results.txt', 'wt')
+
+    for split_filename in hps.splits:
+        dataset_name, dataset_type, splits = parse_splits_filename(split_filename)
+
+        # For no augmentation use only a dataset corresponding to the split file
+        datasets = None
+        if dataset_type == '':
+            datasets = hps.get_dataset_by_name(dataset_name)
+
+        if datasets is None:
+            datasets = hps.datasets
+
+        f_avg = 0
+        n_folds = len(splits)
+        for split_id in range(n_folds):
+            ao = AONet(hps)
+            ao.initialize()
+            ao.load_datasets(datasets=datasets)
+            ao.load_split_file(splits_file=split_filename)
+            ao.select_split(split_id=split_id)
+
+            fscore, fscore_epoch = ao.train(output_dir=hps.output_dir)
+            f_avg += fscore
+
+            # Log F-score for this split_id
+            f.write(split_filename + ', ' + str(split_id) + ', ' + str(fscore) + ', ' + str(fscore_epoch) + '\n')
+            f.flush()
+
+            # Save model with the highest F score
+            _, log_file = os.path.split(split_filename)
+            log_dir, _ = os.path.splitext(log_file)
+            log_dir += '_' + str(split_id)
+            log_file = os.path.join(hps.output_dir, 'models', log_dir) + '_' + str(fscore) + '.tar.pth'
+
+            os.makedirs(os.path.join(hps.output_dir, 'models', ), exist_ok=True)
+            os.system('mv ' + hps.output_dir + '/models_temp/' + log_dir + '/' + str(fscore_epoch) + '_*.pth.tar ' + log_file)
+            os.system('rm -rf ' + hps.output_dir + '/models_temp/' + log_dir)
+
+            print("Split: {0:}   Best F-score: {1:0.5f}   Model: {2:}".format(split_filename, fscore, log_file))
+
+        # Write average F-score for all splits to the results.txt file
+        f_avg /= n_folds
+        f.write(split_filename + ', ' + str('avg') + ', ' + str(f_avg) + '\n')
+        f.flush()
+
+    f.close()
+
+
+if __name__ == "__main__":
+    print_pkg_versions()
+
+    parser = argparse.ArgumentParser("PyTorch implementation of paper \"Summarizing Videos with Attention\"")
+    parser.add_argument('-r', '--root', type=str, default='', help="Project root directory")
+    parser.add_argument('-d', '--datasets', type=str, help="Path to a comma separated list of h5 datasets")
+    parser.add_argument('-s', '--splits', type=str, help="Comma separated list of split files.")
+    parser.add_argument('-t', '--train', action='store_true', help="Train")
+    parser.add_argument('-v', '--verbose', action='store_true', help="Prints out more messages")
+    parser.add_argument('-o', '--output-dir', type=str, default='data', help="Experiment name")
+    args = parser.parse_args()
+
+    # MAIN
+    #======================
+    hps = HParameters()
+    hps.load_from_args(args.__dict__)
+
+    print("Parameters:")
+    print("----------------------------------------------------------------------")
+    print(hps)
+
+    if hps.train:
+        print('I am training!')
+        train(hps)
+    else:
+        print('I am testing!')
+        results=[['No', 'Split', 'Mean F-score']]
+        for i, split_filename in enumerate(hps.splits):
+            f_score = eval_split(hps, split_filename, data_dir=hps.output_dir)
+            results.append([i+1, split_filename, str(round(f_score * 100.0, 3))+"%"])
+
+        print("\nFinal Results:")
+        print_table(results)
+
+
+    sys.exit(0)
+
